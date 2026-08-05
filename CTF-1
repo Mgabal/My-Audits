@@ -1,0 +1,19 @@
+# Ethernaut Level 1 — Fallback
+
+**Vulnerability:** Unprotected ownership transfer in receive()
+**Category:** Access Control
+**Severity:** Critical
+
+## Attack Path
+1. contribute() with dust amount → registers contributions[attacker] > 0
+2. Send ETH directly → triggers receive() → owner = attacker
+3. withdraw() → drain contract
+
+## Root Cause
+receive() changes owner with only two weak checks:
+- msg.value > 0 (trivial)
+- contributions[msg.sender] > 0 (trivially achievable)
+
+## Fix
+Remove ownership transfer from receive(). 
+Never change privileged state in fallback functions.
