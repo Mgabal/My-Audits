@@ -1,0 +1,20 @@
+# Ethernaut Level 2 — Fallout
+
+**Vulnerability:** Typo in constructor name
+**Category:** Access Control
+**Severity:** Critical
+**Real-world example:** Rubixi protocol hack (2016)
+
+## Attack Path
+1. Call Fal1out() — the misnamed "constructor"
+2. owner = attacker
+3. collectAllocations() — drain contract
+
+## Root Cause
+Solidity 0.6.x constructors required exact name match with contract.
+Fal1out ≠ Fallout — one character typo made it a public function.
+Owner was never initialized (address(0)) until attacker called it.
+
+## Fix
+Use the constructor keyword (Solidity 0.7.0+).
+Never rely on function-name-based constructors.
