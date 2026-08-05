@@ -1,3 +1,22 @@
+Vulnerability class: Typo in constructor name — uninitialized owner.
+
+Root cause: Solidity 0.6.x used function-name-based constructors. A single character typo made the constructor a public function callable by anyone.
+
+Real world impact: Rubixi protocol, 2016. Developers renamed contract from DynamicPyramid to Rubixi but forgot to rename the constructor function. Attacker called it and drained funds.
+
+Fix: Solidity 0.7.0+ introduced the constructor keyword specifically to prevent this. Never use function-name-based constructors.
+
+solidity
+// Vulnerable (0.6.x)
+function Fallout() public payable {
+    owner = msg.sender;
+}
+
+// Safe (0.7.0+)
+constructor() public payable {
+    owner = msg.sender;
+}
+markdown
 # Ethernaut Level 2 — Fallout
 
 **Vulnerability:** Typo in constructor name
