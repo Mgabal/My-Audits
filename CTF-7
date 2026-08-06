@@ -1,0 +1,256 @@
+# Ethernaut Level 7 – Force
+
+## Overview
+
+The objective of this challenge is to make the `Force` contract hold a non-zero Ether balance.
+
+At first glance, this seems impossible because the contract is completely empty. It has no payable constructor, no `receive()` function, no `fallback()` function, and no method capable of accepting Ether through a normal transaction.
+
+However, the EVM provides a mechanism that completely bypasses these restrictions: **`selfdestruct`**.
+
+This challenge demonstrates that **any contract can receive Ether, even if its code explicitly provides no way to accept it.**
+
+---
+
+# Vulnerable Contract
+
+```solidity
+contract Force {}
+```
+
+The contract contains:
+
+* No state variables.
+* No functions.
+* No payable constructor.
+* No `receive()`.
+* No `fallback()`.
+
+A normal ETH transfer would fail because there is no payable entry point.
+
+---
+
+# Root Cause
+
+The vulnerability is not inside the contract itself—it comes from an EVM behavior.
+
+When a contract executes:
+
+```solidity
+selfdestruct(target);
+```
+
+the EVM transfers the contract's **entire balance** directly to `target`.
+
+This transfer is performed at the protocol level and **does not invoke any function on the receiving contract**.
+
+As a result:
+
+* `receive()` is not executed.
+* `fallback()` is not executed.
+* The recipient cannot reject the Ether.
+
+---
+
+# Understanding `selfdestruct`
+
+Suppose a helper contract holds 1 wei.
+
+When it executes:
+
+```solidity
+selfdestruct(payable(target));
+```
+
+the EVM performs:
+
+```text
+Helper Balance
+        │
+        ▼
+Transfer Entire Balance
+        │
+        ▼
+Target Contract
+```
+
+No calldata is sent.
+
+No function selector is executed.
+
+No code inside the target contract runs.
+
+The Ether simply appears in the target's balance.
+
+---
+
+# Why Normal Transfers Fail
+
+Sending Ether normally uses one of the contract's payable entry points.
+
+```text
+EOA
+ │
+ ▼
+Force
+
+receive() ? ✗
+fallback() ? ✗
+
+Transaction Reverts
+```
+
+Since `Force` implements neither `receive()` nor a payable `fallback()`, ordinary transfers fail.
+
+---
+
+# Why `selfdestruct` Works
+
+With `selfdestruct`, execution is completely different.
+
+```text
+Helper Contract
+        │
+        ▼
+selfdestruct(target)
+        │
+        ▼
+EVM transfers balance directly
+        │
+        ▼
+Force receives Ether
+```
+
+The transfer bypasses every payable check because **no function call occurs**.
+
+---
+
+# Exploit
+
+Deploy a helper contract funded with a small amount of Ether.
+
+Inside its constructor, immediately execute `selfdestruct` targeting the `Force` contract.
+
+```solidity
+contract HelperContract {
+    constructor(address payable target) payable {
+        selfdestruct(target);
+    }
+}
+```
+
+The exploit script becomes:
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    new HelperContract{value: 1 wei}(
+        payable(address(forceInstance))
+    );
+
+    vm.stopBroadcast();
+}
+```
+
+As soon as the helper contract is deployed, its constructor executes and destroys itself, forcing its balance into the `Force` contract.
+
+---
+
+# Attack Flow
+
+```text
+Deploy Helper Contract
+        │
+        ▼
+Send 1 wei to Constructor
+        │
+        ▼
+Helper Contract Holds ETH
+        │
+        ▼
+selfdestruct(force)
+        │
+        ▼
+EVM Transfers Entire Balance
+        │
+        ▼
+Force Balance > 0
+        │
+        ▼
+Challenge Solved
+```
+
+---
+
+# Security Impact
+
+A contract can **never prevent itself from receiving Ether**.
+
+Even if it has:
+
+* No payable functions.
+* No `receive()`.
+* No `fallback()`.
+
+Its balance can still increase through:
+
+* `selfdestruct`
+* Block rewards (historically)
+* Protocol-level balance changes
+
+Therefore, contract logic should never assume that its Ether balance can only change through its own functions.
+
+---
+
+# Recommended Mitigation
+
+Do **not** rely on:
+
+```solidity
+address(this).balance
+```
+
+as the sole source of truth for protocol state.
+
+Instead:
+
+* Track deposits using dedicated state variables.
+* Base accounting on internal bookkeeping rather than the contract's Ether balance.
+* Design logic assuming Ether may be forcefully sent at any time.
+
+Although the semantics of `selfdestruct` have evolved with recent Ethereum upgrades, contracts should still avoid assumptions that external Ether cannot arrive unexpectedly.
+
+---
+
+# Key Takeaways
+
+* Every contract can receive Ether, even without payable functions.
+* `selfdestruct` transfers Ether at the EVM level.
+* No `receive()` or `fallback()` function is executed during a forced transfer.
+* A contract cannot reject Ether sent via `selfdestruct`.
+* Business logic should never depend on `address(this).balance` remaining unchanged except through expected code paths.
+
+---
+
+# Exploit Summary
+
+```solidity
+contract HelperContract {
+    constructor(address payable target) payable {
+        selfdestruct(target);
+    }
+}
+
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    new HelperContract{value: 1 wei}(
+        payable(address(forceInstance))
+    );
+
+    vm.stopBroadcast();
+}
+```
+
+The exploit deploys a helper contract funded with 1 wei. During construction, the helper immediately calls `selfdestruct`, forcing its entire balance into the `Force` contract. Since `selfdestruct` transfers Ether directly at the EVM level, the target contract cannot reject the transfer, satisfying the challenge objective.
